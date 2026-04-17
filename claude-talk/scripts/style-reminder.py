@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
 """
-UserPromptSubmit hook: emits a one-line reminder of the current voice
-style so style changes take effect on the next message without needing
-a session restart. The full voice prompt was already injected at
-SessionStart; this just nudges the verbosity dial.
+UserPromptSubmit hook. Two jobs:
+
+1. Drain stale speech from this session's queue. Without this, voice
+   chunks from prior turns keep playing after the user has already
+   moved on, so they hear "old" responses. Mirrors what the pi extension
+   does on message_start.
+
+2. Emit a one-line reminder of the current voice style so /tts-style
+   takes effect immediately without a session restart.
 """
 
 import json
+import socket
 import sys
 
 STATE_FILE = "/tmp/loqui-tts-state.json"
+TTS_HOST = "127.0.0.1"
+BROKER_PORT = 18081
 
 REMINDERS = {
     "succinct": "(Voice style: SUCCINCT — keep <voice> tags brief, 1-2 sentences max, only the essentials.)",
@@ -26,6 +34,19 @@ def load_state():
         return {}
 
 
+def stop_session_speech(session_id):
+    """Fire-and-forget stop for this session's queued + playing speech."""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(1)
+        sock.connect((TTS_HOST, BROKER_PORT))
+        cmd = {"type": "stop", "sourceApp": "claude-code", "sessionId": session_id}
+        sock.sendall(json.dumps(cmd).encode() + b"\n")
+        sock.close()
+    except Exception:
+        pass
+
+
 def main():
     # Read hook input but we don't need anything from it
     try:
@@ -36,6 +57,11 @@ def main():
     state = load_state()
     if not state.get("enabled", True):
         sys.exit(0)
+
+    # Drain any stale speech queued for this session before starting the new turn.
+    session_id = state.get("session_id", "")
+    if session_id:
+        stop_session_speech(session_id)
 
     style = state.get("style", "verbose")
     reminder = REMINDERS.get(style)
