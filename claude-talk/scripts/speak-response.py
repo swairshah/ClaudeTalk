@@ -17,8 +17,9 @@ BROKER_PORT = 18081
 STATE_FILE = "/tmp/loqui-tts-state.json"
 DEBUG_LOG = "/tmp/loqui-tts-debug.log"
 
-# Track what we've already spoken to avoid re-speaking on resume/compact
-SPOKEN_FILE = "/tmp/loqui-tts-spoken.json"
+# Per-message dedup. Shared with flush-voice.py (PreToolUse hook) so we don't
+# re-speak chunks that already played mid-turn. Format: {msg_uuid: chunks_spoken}.
+FLUSH_FILE = "/tmp/loqui-tts-flushed.json"
 
 
 def debug(msg):
@@ -37,19 +38,19 @@ def load_state():
         return {"enabled": True, "voice": "auto"}
 
 
-def load_spoken():
-    """Load set of already-spoken message UUIDs."""
+def load_flushed():
+    """Return {msg_uuid: chunk_count_already_spoken}."""
     try:
-        with open(SPOKEN_FILE, "r") as f:
-            return set(json.load(f))
+        with open(FLUSH_FILE, "r") as f:
+            return json.load(f)
     except Exception:
-        return set()
+        return {}
 
 
-def save_spoken(spoken):
+def save_flushed(d):
     try:
-        with open(SPOKEN_FILE, "w") as f:
-            json.dump(list(spoken), f)
+        with open(FLUSH_FILE, "w") as f:
+            json.dump(d, f)
     except Exception:
         pass
 
@@ -154,56 +155,67 @@ def main():
     pid = state.get("claude_pid", os.getpid())
     transcript_path = input_data.get("transcript_path", "")
 
-    # Prefer last_assistant_message — it's exactly the message that triggered this Stop hook,
-    # so there's no replay-history risk and no transcript-flush race.
-    last_msg = input_data.get("last_assistant_message")
+    # Try to read the latest assistant message from the transcript — this gives
+    # us a UUID we can use to dedup against chunks already flushed mid-turn by
+    # the PreToolUse hook. Retry briefly because Claude Code flushes after Stop.
+    msg_uuid = ""
     full_text = ""
+    for attempt in range(8):
+        messages = get_last_assistant_messages(transcript_path)
+        if messages:
+            last = messages[-1]
+            msg_uuid = last.get("uuid", "")
+            content = last.get("message", {}).get("content", "")
+            if isinstance(content, list):
+                full_text = " ".join(
+                    p.get("text", "") for p in content
+                    if isinstance(p, dict) and p.get("type") == "text"
+                )
+            elif isinstance(content, str):
+                full_text = content
+            if full_text:
+                debug(f"transcript msg {msg_uuid[:8]} ({len(full_text)} chars) on attempt {attempt}")
+                break
+        time.sleep(0.15 if attempt < 3 else 0.3)
 
-    if isinstance(last_msg, str) and last_msg.strip():
-        full_text = last_msg
-        debug(f"using last_assistant_message (str, {len(full_text)} chars)")
-    elif isinstance(last_msg, dict):
-        content = last_msg.get("content")
-        if content is None:
-            content = last_msg.get("message", {}).get("content", "")
-        if isinstance(content, list):
-            full_text = " ".join(
-                p.get("text", "") for p in content
-                if isinstance(p, dict) and p.get("type") == "text"
-            )
-        elif isinstance(content, str):
-            full_text = content
-        debug(f"using last_assistant_message (dict, {len(full_text)} chars)")
-    else:
-        # Fallback: poll the transcript for the latest assistant message.
-        debug("no last_assistant_message; falling back to transcript")
-        for attempt in range(8):
-            messages = get_last_assistant_messages(transcript_path)
-            if messages:
-                content = messages[-1].get("message", {}).get("content", "")
-                if isinstance(content, list):
-                    full_text = " ".join(
-                        p.get("text", "") for p in content
-                        if isinstance(p, dict) and p.get("type") == "text"
-                    )
-                elif isinstance(content, str):
-                    full_text = content
-                if full_text:
-                    break
-            time.sleep(0.15 if attempt < 3 else 0.3)
+    # Fallback: if transcript read failed, use last_assistant_message but skip
+    # dedup (we have no UUID to key on). Risk is re-speaking a chunk that the
+    # PreToolUse hook already flushed — accept that as the safer failure mode.
+    if not full_text:
+        last_msg = input_data.get("last_assistant_message")
+        if isinstance(last_msg, str) and last_msg.strip():
+            full_text = last_msg
+            debug(f"transcript empty; using last_assistant_message ({len(full_text)} chars)")
+        elif isinstance(last_msg, dict):
+            content = last_msg.get("content") or last_msg.get("message", {}).get("content", "")
+            if isinstance(content, list):
+                full_text = " ".join(
+                    p.get("text", "") for p in content
+                    if isinstance(p, dict) and p.get("type") == "text"
+                )
+            elif isinstance(content, str):
+                full_text = content
 
     if not full_text:
         debug("no text to speak")
         sys.exit(0)
 
-    voice_chunks = extract_voice_tags(full_text)
-    debug(f"{len(voice_chunks)} voice chunks")
+    chunks = extract_voice_tags(full_text)
+    flushed = load_flushed()
+    already = flushed.get(msg_uuid, 0) if msg_uuid else 0
+    new_chunks = chunks[already:]
 
-    for chunk in voice_chunks:
+    debug(f"total={len(chunks)} flushed={already} new={len(new_chunks)}")
+
+    for chunk in new_chunks:
         ok = send_to_broker(chunk, voice=voice, session_id=session_id, pid=pid)
         debug(f"  sent '{chunk[:60]}' ok={ok}")
 
-    print(json.dumps({"spoken": len(voice_chunks)}))
+    if msg_uuid:
+        flushed[msg_uuid] = len(chunks)
+        save_flushed(flushed)
+
+    print(json.dumps({"spoken": len(new_chunks)}))
     sys.exit(0)
 
 

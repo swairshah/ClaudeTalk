@@ -21,6 +21,16 @@
         ]
       }
     ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/flush-voice.py\""
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [

@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""
+PreToolUse hook: mid-turn flush of <voice> tags.
+
+When Claude pauses to call a tool, we read the in-progress assistant message
+from the transcript, extract any closed <voice>...</voice> tags, and send any
+that haven't been flushed yet to the PiTalk broker. This gives users audio
+feedback during a turn instead of waiting for the entire response to finish.
+
+Dedup is per assistant message UUID — we remember how many chunks we've
+already flushed for each message and only send the new ones. The Stop hook
+shares the same state file so it doesn't re-speak chunks we already flushed.
+"""
+
+import json
+import os
+import re
+import socket
+import sys
+import time
+from datetime import datetime
+
+TTS_HOST = "127.0.0.1"
+BROKER_PORT = 18081
+STATE_FILE = "/tmp/loqui-tts-state.json"
+FLUSH_FILE = "/tmp/loqui-tts-flushed.json"
+DEBUG_LOG = "/tmp/loqui-tts-debug.log"
+
+
+def debug(msg):
+    try:
+        with open(DEBUG_LOG, "a") as f:
+            f.write(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] flush: {msg}\n")
+    except Exception:
+        pass
+
+
+def load_state():
+    try:
+        with open(STATE_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {"enabled": True, "voice": "auto"}
+
+
+def load_flushed():
+    """Return {msg_uuid: chunk_count_already_flushed}."""
+    try:
+        with open(FLUSH_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_flushed(d):
+    try:
+        with open(FLUSH_FILE, "w") as f:
+            json.dump(d, f)
+    except Exception:
+        pass
+
+
+def send_to_broker(text, voice="auto", session_id="unknown", pid=None):
+    try:
+        command = {
+            "type": "speak",
+            "text": text,
+            "sourceApp": "claude-code",
+            "sessionId": session_id,
+        }
+        if voice and voice != "auto":
+            command["voice"] = voice
+        if pid:
+            command["pid"] = pid
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(3)
+        sock.connect((TTS_HOST, BROKER_PORT))
+        sock.sendall(json.dumps(command).encode() + b"\n")
+        data = b""
+        while b"\n" not in data:
+            chunk = sock.recv(1024)
+            if not chunk:
+                break
+            data += chunk
+        sock.close()
+        resp = json.loads(data.decode().strip())
+        return resp.get("ok", False)
+    except Exception:
+        return False
+
+
+def extract_voice_tags(text):
+    """Extract all closed <voice>...</voice> chunks, in order."""
+    pattern = re.compile(r"<voice>(.*?)</voice>", re.DOTALL)
+    matches = pattern.findall(text)
+    cleaned = []
+    for m in matches:
+        clean = re.sub(r"<[^>]+>", " ", m).strip()
+        clean = re.sub(r"\s+", " ", clean)
+        if clean:
+            cleaned.append(clean)
+    return cleaned
+
+
+def get_latest_assistant_message(transcript_path):
+    """Return the last assistant message dict from the JSONL transcript, or None."""
+    if not transcript_path or not os.path.exists(transcript_path):
+        return None
+    last = None
+    try:
+        with open(transcript_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    if obj.get("type") == "assistant":
+                        last = obj
+                except json.JSONDecodeError:
+                    continue
+    except Exception:
+        return None
+    return last
+
+
+def extract_text_from_message(msg):
+    content = msg.get("message", {}).get("content", "")
+    if isinstance(content, list):
+        return " ".join(
+            p.get("text", "") for p in content
+            if isinstance(p, dict) and p.get("type") == "text"
+        )
+    if isinstance(content, str):
+        return content
+    return ""
+
+
+def main():
+    try:
+        input_data = json.loads(sys.stdin.read())
+    except Exception:
+        input_data = {}
+
+    debug(f"=== START === input keys: {list(input_data.keys())}")
+
+    state = load_state()
+    if not state.get("enabled", True):
+        debug("disabled, exit")
+        sys.exit(0)
+
+    transcript_path = input_data.get("transcript_path", "")
+    session_id = state.get("session_id", input_data.get("session_id", "unknown"))
+    voice = state.get("voice", "auto")
+    pid = state.get("claude_pid", os.getpid())
+
+    # Brief retry in case transcript hasn't flushed yet.
+    msg = None
+    for _ in range(3):
+        msg = get_latest_assistant_message(transcript_path)
+        if msg:
+            break
+        time.sleep(0.1)
+
+    if not msg:
+        debug("no assistant message in transcript")
+        sys.exit(0)
+
+    msg_uuid = msg.get("uuid", "")
+    if not msg_uuid:
+        debug("message missing uuid, skipping")
+        sys.exit(0)
+
+    full_text = extract_text_from_message(msg)
+    if not full_text:
+        debug(f"msg {msg_uuid[:8]}: no text content")
+        sys.exit(0)
+
+    chunks = extract_voice_tags(full_text)
+    flushed = load_flushed()
+    already = flushed.get(msg_uuid, 0)
+    new_chunks = chunks[already:]
+
+    debug(f"msg {msg_uuid[:8]}: total={len(chunks)} flushed={already} new={len(new_chunks)}")
+
+    if not new_chunks:
+        sys.exit(0)
+
+    for chunk in new_chunks:
+        ok = send_to_broker(chunk, voice=voice, session_id=session_id, pid=pid)
+        debug(f"  sent '{chunk[:60]}' ok={ok}")
+
+    flushed[msg_uuid] = len(chunks)
+    save_flushed(flushed)
+
+    print(json.dumps({"flushed": len(new_chunks)}))
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
