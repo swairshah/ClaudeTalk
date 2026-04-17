@@ -9,7 +9,7 @@
     {
       "name": "claude-talk",
       "description": "Text-to-speech for Claude Code. Speaks <voice> tagged content from assistant responses via the PiTalk macOS app.",
-      "source": ".",
+      "source": "./claude-talk",
       "category": "productivity"
     }
   ]
