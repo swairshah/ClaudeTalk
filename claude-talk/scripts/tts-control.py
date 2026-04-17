@@ -157,7 +157,7 @@ def main():
                 sys.exit(1)
         state["style"] = new_style
         save_state(state)
-        print(f"Style changed to: {new_style}. Restart session for new prompt to take effect.")
+        print(f"Style changed to: {new_style}. Takes effect on your next message.")
 
     else:
         print(f"Unknown action: {action}")
