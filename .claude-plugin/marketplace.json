@@ -1,0 +1,16 @@
+{
+  "name": "claudetalk",
+  "version": "1.0.0",
+  "description": "Text-to-speech plugin for Claude Code",
+  "owner": {
+    "name": "Swair Shah"
+  },
+  "plugins": [
+    {
+      "name": "claude-talk",
+      "description": "Text-to-speech for Claude Code. Speaks <voice> tagged content from assistant responses via the PiTalk macOS app.",
+      "source": ".",
+      "category": "productivity"
+    }
+  ]
+}
