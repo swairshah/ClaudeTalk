@@ -103,11 +103,18 @@ def extract_voice_tags(text):
     return cleaned
 
 
-def get_latest_assistant_message(transcript_path):
-    """Return the last assistant message dict from the JSONL transcript, or None."""
+def get_recent_assistant_messages(transcript_path, limit=30):
+    """
+    Return the last `limit` assistant messages from the transcript.
+
+    Claude Code splits each turn into multiple assistant messages — one per
+    text chunk, one per tool_use, etc. So the latest message may be a
+    tool_use with no text. We need to look back across recent messages and
+    let per-UUID dedup decide which ones still have unspoken voice content.
+    """
     if not transcript_path or not os.path.exists(transcript_path):
-        return None
-    last = None
+        return []
+    messages = []
     try:
         with open(transcript_path, "r") as f:
             for line in f:
@@ -117,12 +124,12 @@ def get_latest_assistant_message(transcript_path):
                 try:
                     obj = json.loads(line)
                     if obj.get("type") == "assistant":
-                        last = obj
+                        messages.append(obj)
                 except json.JSONDecodeError:
                     continue
     except Exception:
-        return None
-    return last
+        return []
+    return messages[-limit:]
 
 
 def extract_text_from_message(msg):
@@ -156,45 +163,49 @@ def main():
     pid = state.get("claude_pid", os.getpid())
 
     # Brief retry in case transcript hasn't flushed yet.
-    msg = None
+    messages = []
     for _ in range(3):
-        msg = get_latest_assistant_message(transcript_path)
-        if msg:
+        messages = get_recent_assistant_messages(transcript_path)
+        if messages:
             break
         time.sleep(0.1)
 
-    if not msg:
-        debug("no assistant message in transcript")
+    if not messages:
+        debug("no assistant messages in transcript")
         sys.exit(0)
 
-    msg_uuid = msg.get("uuid", "")
-    if not msg_uuid:
-        debug("message missing uuid, skipping")
-        sys.exit(0)
-
-    full_text = extract_text_from_message(msg)
-    if not full_text:
-        debug(f"msg {msg_uuid[:8]}: no text content")
-        sys.exit(0)
-
-    chunks = extract_voice_tags(full_text)
     flushed = load_flushed()
-    already = flushed.get(msg_uuid, 0)
-    new_chunks = chunks[already:]
+    total_new = 0
 
-    debug(f"msg {msg_uuid[:8]}: total={len(chunks)} flushed={already} new={len(new_chunks)}")
+    # Walk recent assistant messages oldest-to-newest. Per-UUID dedup means
+    # text-only messages from earlier in the turn (which the latest tool_use
+    # message replaced as "newest") will get their unspoken chunks flushed
+    # the first time we see them, and skipped on subsequent fires.
+    for msg in messages:
+        msg_uuid = msg.get("uuid", "")
+        if not msg_uuid:
+            continue
+        full_text = extract_text_from_message(msg)
+        if not full_text:
+            continue
+        chunks = extract_voice_tags(full_text)
+        if not chunks:
+            continue
+        already = flushed.get(msg_uuid, 0)
+        new_chunks = chunks[already:]
+        if not new_chunks:
+            continue
 
-    if not new_chunks:
-        sys.exit(0)
+        debug(f"msg {msg_uuid[:8]}: total={len(chunks)} flushed={already} new={len(new_chunks)}")
+        for chunk in new_chunks:
+            ok = send_to_broker(chunk, voice=voice, session_id=session_id, pid=pid)
+            debug(f"  sent '{chunk[:60]}' ok={ok}")
+        flushed[msg_uuid] = len(chunks)
+        total_new += len(new_chunks)
 
-    for chunk in new_chunks:
-        ok = send_to_broker(chunk, voice=voice, session_id=session_id, pid=pid)
-        debug(f"  sent '{chunk[:60]}' ok={ok}")
-
-    flushed[msg_uuid] = len(chunks)
     save_flushed(flushed)
 
-    print(json.dumps({"flushed": len(new_chunks)}))
+    print(json.dumps({"flushed": total_new}))
     sys.exit(0)
 
 
